@@ -1,0 +1,1016 @@
+#client.py
+import os
+import shutil
+import sys
+import asyncio
+import packet
+import websockets
+import json
+import base64
+from datetime import datetime
+from io import BytesIO
+from PIL import Image
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLineEdit,
+    QPushButton, QLabel, QDialog, QDialogButtonBox, QScrollArea, QFrame,
+    QSizePolicy, QFileDialog, QTextEdit, QComboBox, QTextBrowser, QBoxLayout, QListWidget, QListWidgetItem
+)
+from PyQt5.QtGui import QFont, QFontDatabase, QPixmap, QTextOption
+from PyQt5.QtCore import Qt, QTimer, QPoint, QCoreApplication
+from qasync import QEventLoop, asyncSlot
+
+from PyQt5.QtCore import Qt, QTimer, QPoint, QPropertyAnimation, QEasingCurve
+from win32cryptcon import szOID_NETSCAPE_DATA_TYPE
+
+
+def resource_path(relative_path):
+    """
+    PyInstaller로 패키징한 실행 파일에서도 리소스 파일 경로를 제대로 참조하기 위해 사용
+    - 개발 환경: 현재 디렉토리
+    - 배포 환경: _MEIPASS 임시 디렉토리
+    """
+    try:
+        base_path = sys._MEIPASS  # PyInstaller 실행 시 생성되는 임시 폴더
+    except AttributeError:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+# 실행 중인 파일 위치 기준으로 캐시 저장
+CACHE_FILE = os.path.join(
+    os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__),
+    resource_path("users_cache.json")
+)
+
+def load_user_cache():
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"캐시 로딩 실패: {e}")
+        return {}
+
+def save_user_cache(nickname, image_path):
+    try:
+        users = load_user_cache()
+        cache_dir = os.path.join(os.path.dirname(CACHE_FILE), "cache_images")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # 프로필 이미지 복사
+        new_path = os.path.join(cache_dir, f"{nickname}.png")
+        shutil.copy(image_path, new_path)
+        users[nickname] = new_path
+
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f" 캐시 저장 실패: {e}")
+
+
+def resize_image_to_base64(image_path, size=(128, 128)):
+    img = Image.open(image_path)
+    img = img.resize(size)
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+class NicknameDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("닉네임 선택 또는 입력")
+        self.setFixedSize(300, 200)
+        self.image_path = None
+        self.cached_users = load_user_cache()
+
+        layout = QVBoxLayout()
+        self.label = QLabel("닉네임을 선택하거나 새로 입력하세요")
+
+        # 닉네임 선택 콤보박스 + 입력
+        self.nickname_combo = QComboBox()
+        self.nickname_combo.setEditable(True)
+        self.nickname_combo.addItems(self.cached_users.keys())
+        self.nickname_combo.setPlaceholderText("예: 다니")
+
+        self.nickname_combo.currentIndexChanged.connect(self.load_selected_user)
+
+        self.image_button = QPushButton("프로필 이미지 선택")
+        self.image_button.clicked.connect(self.select_image)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout.addWidget(self.label)
+        layout.addWidget(self.nickname_combo)
+        layout.addWidget(self.image_button)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+
+        self.setStyleSheet("""
+            QLabel {
+                font-size: 13px;
+                color: #333;
+            }
+
+            QLineEdit {
+                background-color: #f9f9f9;
+                border: 1px solid #ccc;
+                border-radius: 6px;
+                padding: 5px;
+            }
+
+            QPushButton {
+                background-color: #FFAE0F;
+                color: white;
+                border: none;
+                padding: 8px 14px;
+                border-radius: 6px;
+                font-size: 13px;
+            }
+
+            QPushButton:hover {
+                background-color: #EE9F05;
+            }
+
+            QDialogButtonBox QPushButton {
+                background-color: white;
+                border: 1px solid #ccc;
+                border-radius: 6px;
+                padding: 6px 12px;
+                color: #333;
+                font-size: 13px;
+            }
+
+            QDialogButtonBox QPushButton:hover {
+                background-color: #f2f2f2;
+                border: 1px solid #bbb;
+            }
+        """)
+
+    def load_selected_user(self, index):
+        nickname = self.nickname_combo.currentText()
+        if nickname in self.cached_users:
+            self.image_path = self.cached_users[nickname]
+            self.image_button.setText("자동 선택됨")
+
+
+
+    def select_image(self):
+        file_name, _ = QFileDialog.getOpenFileName(self, "이미지 선택", "", "Images (*.png *.jpg *.jpeg)")
+        if file_name:
+            self.image_path = file_name
+            self.image_button.setText("✅ 선택됨")
+
+    def get_nickname_and_image(self):
+        if self.exec_() == QDialog.Accepted:
+            nickname = self.nickname_combo.currentText().strip()
+
+            # 닉네임이 기존 캐시에 있고 이미지 선택이 안된 경우 -> 자동 보완
+            if nickname in self.cached_users and self.image_path is None:
+                self.image_path = self.cached_users[nickname]
+                self.image_button.setText("자동 선택됨")
+
+            # 닉네임은 새롭지만 이미지 선택 안된 경우 -> 기본 이미지 선택
+            if nickname and self.image_path is None:
+                default_image_path = resource_path("images/face.png")  # <-- 여기!
+                self.image_path = default_image_path
+                print(f"✅ 이미지 미선택 → 기본 이미지로 대체: {self.image_path}")
+
+            if nickname and self.image_path:
+                save_user_cache(nickname, self.image_path)
+                return nickname, self.image_path
+
+        return None, None
+
+class PopupNotification(QWidget):
+    def __init__(self, title: str, message: str, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(300, 80)
+
+        self.label = QLabel(self)
+        self.label.setFixedSize(280, 60)
+        self.label.setWordWrap(True)
+        self.label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+
+        self.label.setTextInteractionFlags(Qt.NoTextInteraction)
+
+        self.label.setText(f"""
+            <span style="color:#FF9500; font-weight:500;">{title}</span><br>
+            <span style="color:#333;">{message}</span>
+        """)
+
+        self.label.setStyleSheet("""
+            QLabel {
+                background-color: white;
+                border-radius: 10px;
+                padding: 10px;
+                border: 1px solid #ccc;
+            }
+        """)
+
+        screen = QApplication.primaryScreen().geometry()
+        x = screen.width() - self.width() - 20
+        y = screen.height() - self.height() - 60
+        self.move(QPoint(x, y))
+
+        self.setWindowOpacity(0.0)
+        self.fade_in = QPropertyAnimation(self, b"windowOpacity")
+        self.fade_in.setDuration(300)
+        self.fade_in.setStartValue(0.0)
+        self.fade_in.setEndValue(1.0)
+        self.fade_in.start()
+
+        QTimer.singleShot(2500, self.close)
+
+class ChatClient(QWidget):
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        for url in event.mimeData().urls():
+            file_path = url.toLocalFile()
+            if os.path.isfile(file_path):
+                asyncio.create_task(self._send_file_task(file_path))
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("✨ 내부 메신저")
+        self.resize(420, 550)
+        self.setObjectName("MainWindow")
+        self.setAcceptDrops(True)  # ← 드래그앤드롭 허용
+
+        self.server_url = "ws://localhost:30006/ws/"
+
+        self.message_map = {}  # reply_id → {"bubble": QLabel, "frame": QFrame}
+        self.thinking_timers = {}  # reply_id → QTimer
+
+        self.setStyleSheet("""
+            QWidget#MainWindow {
+                background-color: #f5f5f5;
+                border-radius: 15px;
+            }
+        """)
+
+        self.profile_image = None
+        self.profiles = {}
+
+        self.image_history = []  # base64 디코딩된 QPixmap 리스트
+        self.current_image_index = 0  # 현재 미리보기 인덱스
+
+        nickname_dialog = NicknameDialog()
+        self.username, image_path = nickname_dialog.get_nickname_and_image()
+        if not self.username:
+            sys.exit()
+
+        if image_path:
+            self.profile_image = resize_image_to_base64(image_path)
+
+        self.websocket = None
+        self.server_url = "ws://localhost:30006/ws/"
+
+        font_path = resource_path("fonts/NanumSquareRoundR.ttf")
+        if os.path.exists(font_path):
+            QFontDatabase.addApplicationFont(font_path)
+            self.setFont(QFont("NanumSquareRound", 10))
+        else:
+            self.setFont(QFont("Arial", 10))
+
+        self.layout = QVBoxLayout()
+
+        self.user_list_label = QLabel("접속 중: ", self)
+        self.user_list_label.setStyleSheet("""
+            QLabel {
+                background-color: #ffffff;
+                padding: 6px;
+                font-size: 12px;
+                color: #333;
+                border-radius: 10px;
+                border: 1px solid #ddd;
+                margin: 0;
+            }
+        """)
+        self.layout.addWidget(self.user_list_label)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: f5f5f5;
+            }
+        """)
+
+        self.scroll_content = QWidget()
+        self.chat_layout = QVBoxLayout(self.scroll_content)
+        self.chat_layout.setSpacing(0)
+        self.chat_layout.addStretch(1)
+        self.scroll_area.setWidget(self.scroll_content)
+        self.layout.addWidget(self.scroll_area)
+
+        input_layout = QHBoxLayout()
+        self.file_button = QPushButton("📤")
+        self.file_button.setFixedSize(40, 30) 
+        self.file_button.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                font-size: 18px;
+            }
+            QPushButton:hover {
+                background-color: #f2f2f2;
+                border: 1px solid #bbb;
+            }
+            QPushButton:pressed {
+                background-color: #e6e6e6;
+                border: 1px solid #aaa;
+            }
+        """)
+        self.file_button.clicked.connect(self.send_file)
+
+        self.input_line = QLineEdit()
+        self.input_line.setPlaceholderText("메시지를 입력하세요.")
+        self.input_line.setStyleSheet("""
+            QLineEdit {
+                background-color: white;
+                border-radius: 10px;
+                padding: 6px;
+                font-size: 14px;
+                border: 1px solid #ccc;
+                margin-right: 10px;
+            }
+        """)
+
+        self.send_button = QPushButton("전송")
+        self.send_button.setStyleSheet("""
+            QPushButton {
+                background-color: #FFAE0F;
+                border-radius: 10px;
+                padding: 10px 20px;
+                font-size: 14px;
+                color: white;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #EE9F05;
+            }
+        """)
+
+        input_layout.addWidget(self.file_button) 
+        input_layout.addWidget(self.input_line)
+        input_layout.addWidget(self.send_button)
+
+        self.layout.addLayout(input_layout)
+        self.setLayout(self.layout)
+
+        self.send_button.clicked.connect(self.send_message)
+        self.input_line.returnPressed.connect(self.send_message)
+
+        """로딩 문구용 QLABEL 추가"""
+        self.loading_label = QLabel("💬 채팅 기록 불러오는 중...")
+        self.loading_label.setAlignment(Qt.AlignCenter)
+        self.loading_label.setStyleSheet("color: gray; font-size: 12px; margin: 10px;")
+        self.chat_layout.insertWidget(0, self.loading_label)
+        self.loading_label.hide()
+
+        # 읽은 시점 반영 위한 상태 변수
+        self.history_loaded = False
+        self.separator_shown = False
+
+        # read_message_count 저장 변수 추가
+        #self.read_message_count = 0
+
+        self.last_received_message_id = None  # ✅ 메시지 ID 기반 읽은 위치 초기화
+
+        self.private_chats = {} # 개인 채팅방 저장용 딕셔너리 초기화
+
+        # 유저 리스트 객체 이름 수정
+        self.user_list = QListWidget(self)
+        self.user_list.itemDoubleClicked.connect(self.open_private_chat)    # 더블클릭하여 개인 채팅방 개설
+        self.layout.addWidget(self.user_list)   # 유저 목록도 레이아웃에 포함
+
+    async def check_nickname_available(self,nickname):
+        async with websockets.connect(self.server_url) as ws:
+            await ws.send(json.dumps({"type": "validate", "nickname": nickname}))
+            response = await ws.recv()
+            result = json.loads(response)
+            return result.get("available", False)
+
+
+    def set_loading_state(self, loading: bool):
+        if loading:
+            print("로딩 중입니다..")
+            self.loading_label.show()
+
+        else:
+            print("로딩이 완료되었습니다.")
+            self.loading_label.hide()
+
+    async def connect(self):
+        try:
+            self.websocket = await websockets.connect(
+                self.server_url + self.username,
+                max_size=None  # ← 제한 해제
+            )
+            await self.receive_messages()
+
+
+
+
+        except Exception as e:
+            self.add_message(f"❌ 연결 실패: {e}", is_system=True)
+
+    @asyncSlot()
+    async def send_message(self):
+        message = self.input_line.text().strip()
+        if message and self.websocket:
+            packet = {
+                "sender": self.username,
+                "message": message,
+                "profile": self.profile_image
+            }
+
+            asyncio.create_task(self._safe_send(json.dumps(packet)))
+
+            self.add_message(message, from_self=True, profile=self.profile_image)
+            self.input_line.clear()
+
+    # WebSocket 전송을 한 Task 안에서만 처리하도록 보장
+    async def _safe_send(self, data: str):
+        try:
+            await self.websocket.send(data)
+        except Exception as e:
+            self.add_message(f"❌ 전송 오류: {e}")
+
+    @asyncSlot()
+    async def send_file(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "이미지 선택", "", "Images (*.png *.jpg *.jpeg *.gif)")
+
+        for file_path in file_paths:
+            if file_path:
+                await self._send_file_task(file_path)
+
+    async def _send_file_task(self, file_path):
+        try:
+            with open(file_path, "rb") as f:
+                data = base64.b64encode(f.read()).decode("utf-8")
+
+            filename = os.path.basename(file_path)
+            ext = os.path.splitext(filename)[1].lower()
+
+            packet = {
+                "sender": self.username,
+                "message": f"[파일] {filename}",
+                "profile": self.profile_image,
+                "file": {
+                    "name": filename,
+                    "data": data,
+                    "type": ext 
+                }
+            }
+
+            await self._safe_send(json.dumps(packet))
+
+            self.add_file_message(filename, data, ext, from_self=True, profile=self.profile_image)
+
+        except Exception as e:
+            self.add_message(f"❌ 파일 전송 실패: {e}")
+
+    async def receive_messages(self):
+
+        try:
+            async for raw in self.websocket:
+                packet = json.loads(raw)
+
+                """개인톡 분기 처리"""
+                if packet["type"] == "private_room":
+                    sender = packet["sender"]
+                    receiver = packet["receiver"]
+                    msg = packet["message"]
+
+                    # 현재 내가 수신자 or 발신자인 경우만 해당 창 띄우기
+                    if receiver == self.username or sender == self.username:
+                        partner = sender if sender != self.username else receiver
+                        if partner not in self.private_chats:
+                            self.open_private_chat(QListWidgetItem(partner))
+                        self.private_chats[partner].receive_message(sender, msg)
+
+
+
+
+
+
+
+
+                if "sender" in packet and "message" in packet:
+                    sender = packet["sender"]
+                    message = packet["message"]
+                    profile = packet.get("profile")
+                    is_me = (sender == self.username)
+
+                    # 히스토리 이후, 처음 도착한 타인 메세지에 구분선 삽입
+                    if self.history_loaded and not is_me and not self.separator_shown:
+                        self.add_separator()
+                        self.separator_shown = True
+
+                    file_info = packet.get("file")
+                    if file_info:
+                        if sender == self.username:
+                            continue
+
+                        self.add_file_message(
+                            filename=file_info["name"],
+                            data_b64=file_info["data"],
+                            ext=os.path.splitext(file_info["name"])[1].lower(),
+                            from_self=False,
+                            profile=profile,
+                            sender_name=sender,  #여기 추가
+
+                        )
+                        continue
+
+                    self.profiles[sender] = profile
+                    if sender != self.username:
+                        self.add_message(
+                            f"{sender}: {message}",
+                            from_self=False,
+                            profile=profile,
+                            is_system = False
+                        )
+                        popup = PopupNotification(sender, message)
+                        popup.show()
+
+                elif "users" in packet:
+                    self.update_user_list(packet["users"])
+
+                # type에 히스토리 있을 시, 이전 대화 불러옴(당일 한정)
+                elif packet.get("type") == "history":
+                    self.set_loading_state(True)  # ⬅️ 로딩 시작 표시
+                    self.last_read_id = packet.get("last_read_id")
+
+                    #self.read_message_count = packet.get("read_count", 0)  # ✅ 서버 응답 기준
+
+                    for i, msg in enumerate(packet["messages"]):
+                        message_id = msg["id"]
+                        is_me = (msg["sender"] == self.username)
+                        """내가 전송한 대화 기록은 잘못 불러오고 있음,,, 타인의 대화 기록은 정상적으로 로드"""
+                        self.add_message(
+                            text=f"{msg['sender']}:{msg['message']}",
+                            from_self=is_me,
+                            profile=msg.get("profile"),
+                            timestamp=msg.get("timestamp"), # time 추가
+                            is_system=False
+                        )
+
+
+                        if self.last_read_id is not None and message_id == self.last_read_id:
+                            print(f"👁 구분선 삽입 위치: {i}")
+                            self.add_separator()
+
+                    # 상태 초기화
+                    self.history_loaded = True
+                    self.separator_shown = False
+                    self.set_loading_state(False)  # ⬅️ 로딩 끝
+
+                    #최하단 말고, 구분선 위치로 이동
+                    QTimer.singleShot(1000, self.scroll_to_separator)
+
+                # 메시지 수신할 때마다 마지막 ID 저장
+                # 안전하게 접근하기
+                self.last_received_message_id = packet.get("id", self.last_received_message_id)
+
+        except Exception as e:
+            self.add_message(f"❌ 연결 종료: {e}", is_system=True)
+
+    """ 오버라이드해서 종료 직전에 읽은 메시지 수를 서버에 전송"""
+    def closeEvent(self, event):
+        async def send_and_exit():
+            if self.websocket and self.last_received_message_id:
+                try:
+                    await self._safe_send(json.dumps({
+                        "type": "update_read_id",
+                        "username": self.username,
+                        "message_id": self.last_received_message_id
+                    }))
+                    print("📤 마지막 읽은 ID 전송 완료")
+                    await asyncio.sleep(0.2)  # ⏳ 서버에 전달될 시간을 줌
+                except Exception as e:
+                    print(f"❌ 전송 실패: {e}")
+            QCoreApplication.quit()  # 종료
+
+        asyncio.ensure_future(send_and_exit())  # 이벤트 루프에 등록
+        event.ignore()  # 바로 종료하지 않음
+
+    
+    
+    """구분선 함수 정의"""
+    def add_separator(self):
+        print("✅ 구분선 추가됨")
+        separator = QLabel("🔽 이후 새 메시지")
+        separator.setAlignment(Qt.AlignCenter)
+        separator.setStyleSheet("color: #999; font-size: 11px; margin: 8px;")
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, separator)
+        
+        self.separator_label = separator   # 나중에 스크롤 위치 확인용으로 저장
+        print("✅ separator_label 설정 완료")
+
+        # 삽입 후 렌더링 완료되면 스크롤 이동
+        QTimer.singleShot(2000, self.scroll_to_separator)
+
+    def add_message(self, text, reply_id=None, from_self=False, is_system=False, profile=None, timestamp=None):
+        if timestamp:
+            try:
+                time_str = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
+            except:
+                time_str = timestamp    # 형식이 맞지 않을 경우 그대로 출력
+        else:
+            time_str = datetime.now().strftime("%H:%M")
+
+        # 이름: 메시지 형식일 경우, 분리
+        if not from_self and not is_system and ":" in text:
+            sender, message = text.split(":", 1)
+        else:
+            message = text
+
+
+        """ gpt 로딩 후 말풍선 내용 교체"""
+        # 👉 reply_id가 있을 경우 기존 말풍선을 찾아 업데이트만 수행
+        if reply_id and hasattr(self, "message_map") and reply_id in self.message_map:
+            # 기존 QLabel 가져와서 텍스트만 교체
+
+            bundle = self.message_map[reply_id]
+            bubble = bundle["bubble"]
+
+            bubble.setText(message.strip()) # 텍스트 교체
+
+            # 타이머 중단
+            if reply_id in self.thinking_timers:
+                self.thinking_timers[reply_id].stop()
+                del self.thinking_timers[reply_id]
+
+            return  # 업데이트만 하고 말풍선 새로 추가는 하지 않음
+
+        # 👉 reply_id가 없거나 신규 메시지일 경우 새 말풍선 생성
+        bubble = QLabel(message.strip())
+        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse) 
+        bubble.setWordWrap(True)
+        bubble.setMaximumWidth(340)
+        bubble.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        bubble.setStyleSheet(f"""
+            background-color: {'#FFCF71' if from_self else '#ffffff'};
+            padding: 8px 8px;
+            border-radius: 14px;
+            color: black;
+        """)
+        bubble.adjustSize()
+
+        # 시간 라벨
+        time_label = QLabel(time_str)
+        time_label.setStyleSheet("color: gray; font-size: 10px; margin: 1px;")
+
+        # 상대방 이름 라벨 (본인 메시지는 표시 안 함)
+        if not from_self and not is_system:
+            name_label = QLabel(sender)
+            name_label.setStyleSheet("color: black; font-size: 11px; margin-bottom: 0;")
+            layout_name = QVBoxLayout()
+            layout_name.setContentsMargins(10, 0, 10, 0)
+            layout_name.addWidget(name_label, alignment=Qt.AlignLeft)
+            self.chat_layout.insertLayout(self.chat_layout.count() - 1, layout_name)
+
+        # 말풍선 + 시간 묶기
+        bubble_container = QVBoxLayout()
+        bubble_container.addWidget(bubble)
+        bubble_container.addWidget(time_label, alignment=Qt.AlignRight if from_self else Qt.AlignLeft)
+
+        profile_label = QLabel()
+        profile_label.setFixedSize(36, 36)
+        if profile:
+            try:
+                # base64 길이 보정
+                missing_padding = len(profile) % 4
+                if missing_padding:
+                    profile += '=' * (4 - missing_padding)
+
+                pixmap = QPixmap()
+                pixmap.loadFromData(base64.b64decode(profile))
+            except Exception as e:
+                print(f"❌ 프로필 이미지 디코딩 실패: {e}")
+                default_path = os.path.join(os.path.dirname(__file__), "images/face.png")
+                pixmap = QPixmap(default_path)
+
+        else:
+            DEFAULT_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "images/face.png")
+            pixmap = QPixmap(DEFAULT_PROFILE_PATH)
+            if pixmap.isNull():
+                print("❌ QPixmap failed to load face.png at", DEFAULT_PROFILE_PATH)
+
+        profile_label.setPixmap(pixmap.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        # 말풍선 프레임 구성
+        bubble_frame = QFrame()
+        layout = QHBoxLayout(bubble_frame)
+        layout.setContentsMargins(10, 4, 10, 4)
+
+        if from_self:
+            layout.addStretch()
+            layout.addLayout(bubble_container)
+            layout.addWidget(profile_label)
+        else:
+            layout.addWidget(profile_label)
+            layout.addLayout(bubble_container)
+            layout.addStretch()
+
+        # 말풍선 추가
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble_frame)
+
+        # reply_id가 있으면 해당 말풍선을 기억해 둠 (GPT 응답 시 업데이트용)
+        if reply_id:
+            if not hasattr(self, "message_map"):
+                self.mesage_map = {}    # 최초 생성
+            self.message_map[reply_id] = {
+                "bubble": bubble,
+                "frame": bubble_frame
+            }
+            self.start_thinking_animation(reply_id)  # 👈 여기에 애니메이션 시작 호출!
+        # 스크롤 맨 아래로
+        QTimer.singleShot(10, self.scroll_to_bottom)
+
+    """깜빡이는 함수 추가"""
+    def start_thinking_animation(self, reply_id):
+        if reply_id not in self.message_map:
+            return
+
+        bubble = self.message_map[reply_id]["bubble"]
+        self.thinking_dots = 0 # 점 개수 초기화
+
+        def update_text():
+            self._thinking_dots = (self.thinking_dots + 1) % 4
+            dots = "." * self._thinking_dots
+            bubble.setText(f"⏳ 답변을 생성 중입니다{dots}")
+
+        timer = QTimer(self)
+        timer.timeout.connect(update_text)
+        timer.start(500)
+        self.thinking_timers[reply_id] = timer
+
+
+
+    def add_file_message(self, filename, data_b64, ext, from_self=False, profile=None, sender_name=None):
+        time_str = datetime.now().strftime("%H:%M")
+        is_image = ext in [".png", ".jpg", ".jpeg", ".gif"]
+
+        # 이름 라벨 처리 (본인이 보낸 게 아닐 때만, 그리고 sender_name이 존재할 때만)
+        if not from_self and sender_name:
+            name_label = QLabel(sender_name)
+            name_label.setStyleSheet("color: black; font-size: 11px; margin-bottom: 0;")
+            layout_name = QVBoxLayout()
+            layout_name.setContentsMargins(10, 0, 10, 0)
+            layout_name.addWidget(name_label, alignment=Qt.AlignLeft)
+            self.chat_layout.insertLayout(self.chat_layout.count() - 1, layout_name)
+
+        profile_label = QLabel()
+        profile_label.setFixedSize(36, 36)
+        if profile:
+            pixmap = QPixmap()
+            pixmap.loadFromData(base64.b64decode(profile))
+        else:
+            default = QPixmap(os.path.join(os.path.dirname(__file__), "images/face.png"))
+            pixmap = default
+        profile_label.setPixmap(pixmap.scaled(36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        content_widget = QWidget()
+        layout = QVBoxLayout(content_widget)
+        layout.setContentsMargins(10, 4, 10, 4)
+
+        if is_image:
+            image_container = QFrame()
+            image_container.setStyleSheet("border: none;")
+            image_layout = QVBoxLayout(image_container)
+            image_layout.setContentsMargins(0, 0, 0, 0)
+
+            image_label = QLabel()
+            pixmap = QPixmap()
+            pixmap.loadFromData(base64.b64decode(data_b64))
+
+            # 이미지 히스토리에 추가
+            self.image_history.append(pixmap)
+
+            image_label.setPixmap(pixmap.scaledToWidth(180))
+            image_label.setCursor(Qt.PointingHandCursor)
+
+            # 현재 인덱스를 캡쳐해서 넘김
+            index = len(self.image_history) - 1
+            image_label.mousePressEvent = lambda e, idx=index: self.show_full_image(idx)
+
+            image_layout.addWidget(image_label)
+            layout.addWidget(image_container)
+
+            file_label = QLabel(f"💾 {filename}")
+            file_label.setStyleSheet("color: blue; text-decoration: underline;")
+            file_label.setCursor(Qt.PointingHandCursor)
+            file_label.mousePressEvent = lambda e: self.save_file(filename, data_b64)
+            layout.addWidget(file_label)
+
+        time_label = QLabel(time_str)
+        time_label.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(time_label, alignment=Qt.AlignRight if from_self else Qt.AlignLeft)
+
+        bubble_frame = QFrame()
+        bubble_layout = QHBoxLayout(bubble_frame)
+        bubble_layout.setContentsMargins(10, 4, 10, 4)
+
+        if from_self:
+            bubble_layout.addStretch()
+            bubble_layout.addWidget(content_widget)
+            bubble_layout.addWidget(profile_label)
+        else:
+            bubble_layout.addWidget(profile_label)
+            bubble_layout.addWidget(content_widget)
+            bubble_layout.addStretch()
+
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble_frame)
+        QTimer.singleShot(10, self.scroll_to_bottom)
+
+    # 이미지 눌렀을 때 크게 해서 미리보기
+    def show_full_image(self, index):
+        self.current_image_index = index
+
+        class ImageDialog(QDialog):
+            def __init__(dialog_self):
+                super().__init__(self)
+                dialog_self.setWindowTitle("이미지 보기")
+                dialog_self.setFixedSize(600, 640)
+                dialog_self.setModal(True)
+
+                # 레이아웃 설정
+                dialog_self.layout = QVBoxLayout(dialog_self)
+                dialog_self.layout.setContentsMargins(10, 10, 10, 10)
+                dialog_self.layout.setSpacing(10)
+
+                # 이미지 라벨
+                dialog_self.label = QLabel()
+                dialog_self.label.setAlignment(Qt.AlignCenter)
+                dialog_self.layout.addWidget(dialog_self.label)
+
+                # 인덱스 표시 라벨
+                dialog_self.page_label = QLabel()
+                dialog_self.page_label.setAlignment(Qt.AlignCenter)
+                dialog_self.page_label.setStyleSheet("color: black; font-size: 12px;")
+                dialog_self.layout.addWidget(dialog_self.page_label)
+
+                dialog_self.update_image()
+
+            def update_image(dialog_self):
+                pixmap = self.image_history[self.current_image_index]
+                dialog_self.label.setPixmap(pixmap.scaled(
+                    580, 580, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+                # 인덱스 정보 표시
+                dialog_self.page_label.setText(
+                    f"{self.current_image_index + 1} / {len(self.image_history)}"
+                )
+
+            def keyPressEvent(dialog_self, event):
+                if event.key() == Qt.Key_Right and self.current_image_index < len(self.image_history) - 1:
+                    self.current_image_index += 1
+                    dialog_self.update_image()
+                elif event.key() == Qt.Key_Left and self.current_image_index > 0:
+                    self.current_image_index -= 1
+                    dialog_self.update_image()
+                elif event.key() == Qt.Key_Escape:
+                    dialog_self.reject()
+
+            def wheelEvent(dialog_self, event):
+                delta = event.angleDelta().y()
+                if delta < 0 and self.current_image_index < len(self.image_history) - 1:
+                    self.current_image_index += 1
+                    dialog_self.update_image()
+                elif delta > 0 and self.current_image_index > 0:
+                    self.current_image_index -= 1
+                    dialog_self.update_image()
+
+        dialog = ImageDialog()
+        dialog.exec_()
+
+    def save_file(self, filename, data_b64):
+        save_path, _ = QFileDialog.getSaveFileName(self, "파일 저장", filename)
+
+        if not save_path:
+            return
+
+        _, ext = os.path.splitext(filename)
+        if ext and not save_path.lower().endswith(ext):
+            save_path += ext
+
+        try:
+            with open(save_path, "wb") as f:
+                f.write(base64.b64decode(data_b64))
+        except Exception as e:
+            print(f"❌ 파일 저장 실패: {e}")
+
+    # 서버에서 받은 유저 목록 적용
+    def update_user_list(self, users):
+        self.user_list.clear()
+        for user in users:
+            if user != self.username:
+                self.user_list.addItem(user)
+        self.user_list_label.setText(f"접속 중: {', '.join(users)}")
+
+
+    # 채팅방 개설 함수
+    def open_private_chat(self, item):
+        partner = item.text()
+        chat_window = PrivateChatWindow(self.username, partner, self.websocket)
+        chat_window.setWindowTitle(f"{self.username} ↔ {partner}")
+        chat_window.show()
+        self.private_chats[partner] = chat_window
+
+
+    """
+    def scroll_to_bottom(self):
+        self.scroll_area.verticalScrollBar().setValue(
+            self.scroll_area.verticalScrollBar().maximum()
+        )
+    """
+    # 개선 버전
+    def scroll_to_bottom(self):
+        scroll_bar = self.scroll_area.verticalScrollBar()
+        if scroll_bar:
+            scroll_bar.setValue(scroll_bar.maximum())
+
+    # 스크롤 함수 추가: 구분선 위치로 이동
+    def scroll_to_separator(self):
+        """
+        이후 새 메시지 라벨이 보이도록 스크롤을 이동
+        :return:
+        """
+        print("scroll_to_separator 호출")
+        if hasattr(self, "separator_label") and self.separator_label is not None:
+            print("🔽 구분선까지 이동 시도")
+            self.scroll_area.ensureWidgetVisible(self.separator_label, yMargin=20)
+        else:
+            print("⚠️ 구분선이 아직 존재하지 않음!")
+    
+class PrivateChatWindow(QDialog):
+    def __init__(self, sender, receiver, websocket):
+        super().__init__()
+        self.sender = sender
+        self.receiver = receiver
+        self.websocket = websocket
+
+        self.setWindowTitle(f"{self.sender} ↔ {self.receiver}")
+        self.resize(400, 300)
+
+        self.chat_area = QTextBrowser()
+        self.input = QLineEdit()
+        self.send_button = QPushButton("보내기")
+
+        layout = QVBoxLayout()  # ✅ 수직 레이아웃 명확히 지정
+        layout.addWidget(self.chat_area)
+        layout.addWidget(self.input)
+        layout.addWidget(self.send_button)
+        self.setLayout(layout)
+
+        self.send_button.clicked.connect(self.send_private_message)
+        self.input.returnPressed.connect(self.send_private_message)
+
+    def send_private_message(self):
+        msg = self.input.text().strip()
+        if msg:
+            packet = {
+                "type": "private_room",
+                "sender": self.sender,
+                "receiver": self.receiver,
+                "message": msg
+            }
+            asyncio.create_task(self.websocket.send(json.dumps(packet)))
+            #self.chat_area.append(f"나: {msg}")
+            self.input.clear()
+
+    def receive_message(self, sender, message):  # ✅ 메서드명 수정 (recieve → receive)
+        self.chat_area.append(f"{sender}: {message}")
+
+
+def main():
+    app = QApplication(sys.argv)
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
+    client = ChatClient()
+    client.show()
+
+    with loop:
+        loop.create_task(client.connect())
+        loop.run_forever()
+
+if __name__ == "__main__":
+    main()
